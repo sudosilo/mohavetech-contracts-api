@@ -4,6 +4,7 @@ import crypto from "node:crypto";
 import { pool, setupDatabase } from "./db.js";
 import { redis } from "./redis.js";
 import { assistReady, assistAllowed, cleanupTerms, draftTerms } from "./assist.js";
+import { chainReady, chainName, walletStatus, writeHash } from "./chain.js";
 import { newPin, normalizePin, hashPin, pinMatches, countAttempt, clearAttempts } from "./pin.js";
 
 const app = express();
@@ -81,6 +82,7 @@ app.get(
       database: "connected",
       redis: "connected",
       assist: assistReady() ? "ready" : "missing key",
+      chain: chainReady() ? "ready" : "missing wallet",
     };
     try {
       await pool.query("SELECT 1");
@@ -257,12 +259,78 @@ const devKeyHash =
     ? hashToken(process.env.DEV_TOOLS_KEY)
     : null;
 
+function devKeyOk(req) {
+  return devKeyHash !== null && tokenMatches(req.get("X-Dev-Key"), devKeyHash);
+}
+
+function documentHash(row, salt) {
+  const payload = JSON.stringify({
+    v: 1,
+    salt,
+    date: row.date,
+    contract_type: row.contract_type,
+    custom_type: row.custom_type,
+    party_a_name: row.party_a_name,
+    party_b_name: row.party_b_name,
+    terms: row.terms,
+  });
+  return crypto.createHash("sha256").update(payload, "utf8").digest("hex");
+}
+
+app.get(
+  "/dev/wallet",
+  wrap(async (req, res) => {
+    if (!devKeyOk(req)) return res.status(404).json({ error: "not found" });
+    res.json(await walletStatus());
+  })
+);
+
+app.post(
+  "/dev/contracts/:id/notarize",
+  wrap(async (req, res) => {
+    if (!devKeyOk(req)) return res.status(404).json({ error: "not found" });
+    if (!chainReady()) return res.status(503).json({ error: "house wallet is not configured" });
+
+    const { rows } = await pool.query(
+      `UPDATE contracts SET status = 'notarizing', updated_at = now()
+       WHERE id = $1 AND status IN ('drafting', 'signed')
+       RETURNING id, to_char(created_date, 'YYYY-MM-DD') AS date, contract_type, custom_type,
+         party_a_name, party_b_name, terms`,
+      [req.params.id]
+    );
+    if (rows.length === 0) return res.status(409).json({ error: "missing, busy, or already notarized" });
+    const row = rows[0];
+
+    const salt = crypto.randomBytes(16).toString("hex");
+    const docHash = documentHash(row, salt);
+
+    let written;
+    try {
+      written = await writeHash(docHash);
+    } catch (err) {
+      await pool.query("UPDATE contracts SET status = 'drafting', updated_at = now() WHERE id = $1", [
+        row.id,
+      ]);
+      console.error("chain write failed", err.message);
+      return res.status(502).json({ error: "chain write failed", detail: String(err.message).slice(0, 200) });
+    }
+
+    const pin = newPin();
+    await pool.query(
+      `UPDATE contracts SET status = 'notarized', chain = $2, doc_hash = $3, doc_salt = $4,
+         tx_hash = $5, block_number = $6, gas_paid = $7, notarized_at = now(),
+         pin_hash = $8, updated_at = now()
+       WHERE id = $1`,
+      [row.id, chainName(), docHash, salt, written.txHash, written.blockNumber, written.gasPaid, await hashPin(pin)]
+    );
+    res.json({ id: row.id, date: row.date, pin, tx_hash: written.txHash, block_number: written.blockNumber, gas_paid: written.gasPaid });
+  })
+);
+
 app.post(
   "/dev/contracts/:id/fake-notarize",
   wrap(async (req, res) => {
-    if (!devKeyHash || !tokenMatches(req.get("X-Dev-Key"), devKeyHash)) {
-      return res.status(404).json({ error: "not found" });
-    }
+    if (!devKeyOk(req)) return res.status(404).json({ error: "not found" });
     const pin = newPin();
     const { rows } = await pool.query(
       `UPDATE contracts SET status = 'notarized', chain = 'polygon-amoy (simulated)',

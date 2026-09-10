@@ -31,4 +31,5 @@ export async function setupDatabase() {
       pin_hash TEXT
     )
   `);
+  await pool.query("ALTER TABLE contracts ADD COLUMN IF NOT EXISTS doc_salt TEXT");
 }
