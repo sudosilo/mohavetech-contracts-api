@@ -32,4 +32,18 @@ export async function setupDatabase() {
     )
   `);
   await pool.query("ALTER TABLE contracts ADD COLUMN IF NOT EXISTS doc_salt TEXT");
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS signatures (
+      contract_id TEXT NOT NULL REFERENCES contracts(id),
+      party TEXT NOT NULL CHECK (party IN ('a', 'b')),
+      typed_name TEXT NOT NULL,
+      drawing TEXT NOT NULL,
+      consent_text TEXT NOT NULL,
+      content_hash TEXT NOT NULL,
+      signed_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      ip TEXT,
+      user_agent TEXT,
+      PRIMARY KEY (contract_id, party)
+    )
+  `);
 }
