@@ -3,9 +3,11 @@ import cors from "cors";
 import crypto from "node:crypto";
 import { pool, setupDatabase } from "./db.js";
 import { redis } from "./redis.js";
+import { assistReady, assistAllowed, cleanupTerms, draftTerms } from "./assist.js";
 import { newPin, normalizePin, hashPin, pinMatches, countAttempt, clearAttempts } from "./pin.js";
 
 const app = express();
+app.set("trust proxy", 1);
 app.use(express.json({ limit: "100kb" }));
 
 const allowedOrigins = (process.env.ALLOWED_ORIGINS || "")
@@ -74,7 +76,12 @@ const wrap = (handler) => (req, res, next) => handler(req, res).catch(next);
 app.get(
   "/health",
   wrap(async (req, res) => {
-    const result = { ok: true, database: "connected", redis: "connected" };
+    const result = {
+      ok: true,
+      database: "connected",
+      redis: "connected",
+      assist: assistReady() ? "ready" : "missing key",
+    };
     try {
       await pool.query("SELECT 1");
     } catch {
@@ -186,6 +193,63 @@ app.post(
     await clearAttempts(req.params.id);
     res.json(contract);
   })
+);
+
+function textField(body, name, max) {
+  const value = body ? body[name] : undefined;
+  if (value === undefined || value === "") return { value: "" };
+  if (typeof value !== "string") return { error: `${name} must be text` };
+  if (value.length > max) return { error: `${name} is longer than ${max} characters` };
+  return { value };
+}
+
+async function runAssist(req, res, requiredField, requiredMax, work) {
+  if (!assistReady()) return res.status(503).json({ error: "assistant is not configured" });
+  const required = textField(req.body, requiredField, requiredMax);
+  if (required.error) return res.status(400).json({ error: required.error });
+  if (!required.value.trim()) return res.status(400).json({ error: `${requiredField} is empty` });
+  const extras = {};
+  for (const name of ["contract_type", "party_a_name", "party_b_name"]) {
+    const field = textField(req.body, name, 200);
+    if (field.error) return res.status(400).json({ error: field.error });
+    extras[name] = field.value;
+  }
+  if (!(await assistAllowed(req.ip))) {
+    return res.status(429).json({ error: "assistant limit reached, try again in an hour" });
+  }
+  try {
+    const suggestion = await work(required.value, extras);
+    res.json({ suggestion });
+  } catch (err) {
+    console.error("assist failed", err.status, err.message);
+    res.status(502).json({
+      error: "assistant unavailable",
+      detail: String(err.message || "").slice(0, 200),
+    });
+  }
+}
+
+app.post(
+  "/assist/cleanup",
+  wrap((req, res) =>
+    runAssist(req, res, "terms", 20000, (terms, extras) =>
+      cleanupTerms({ terms, contractType: extras.contract_type })
+    )
+  )
+);
+
+app.post(
+  "/assist/draft",
+  wrap((req, res) =>
+    runAssist(req, res, "description", 5000, (description, extras) =>
+      draftTerms({
+        description,
+        contractType: extras.contract_type,
+        partyA: extras.party_a_name,
+        partyB: extras.party_b_name,
+      })
+    )
+  )
 );
 
 const devKeyHash =
