@@ -8,7 +8,7 @@ import { chainReady, chainName, walletStatus, writeHash } from "./chain.js";
 import { newPin, normalizePin, hashPin, pinMatches, countAttempt, clearAttempts } from "./pin.js";
 
 const app = express();
-app.set("trust proxy", 1);
+app.set("trust proxy", 2);
 app.use(express.json({ limit: "400kb" }));
 
 const allowedOrigins = (process.env.ALLOWED_ORIGINS || "")

@@ -35,17 +35,22 @@ const DRAFT_SYSTEM =
   "no preamble, no closing notes, no markdown.";
 
 async function ask(system, userText) {
-  const message = await client.messages.create({
-    model: MODEL,
-    max_tokens: 2000,
-    system,
-    messages: [{ role: "user", content: userText }],
-  });
-  return message.content
+  const message = await client.messages.create(
+    {
+      model: MODEL,
+      max_tokens: 4000,
+      system,
+      messages: [{ role: "user", content: userText }],
+    },
+    { timeout: 25000, maxRetries: 1 }
+  );
+  const text = message.content
     .filter((block) => block.type === "text")
     .map((block) => block.text)
     .join("")
     .trim();
+  if (!text) throw new Error(`empty reply from the model (stop reason: ${message.stop_reason})`);
+  return text;
 }
 
 export function cleanupTerms({ terms, contractType }) {
