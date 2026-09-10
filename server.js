@@ -2,6 +2,8 @@ import express from "express";
 import cors from "cors";
 import crypto from "node:crypto";
 import { pool, setupDatabase } from "./db.js";
+import { redis } from "./redis.js";
+import { newPin, normalizePin, hashPin, pinMatches, countAttempt, clearAttempts } from "./pin.js";
 
 const app = express();
 app.use(express.json({ limit: "100kb" }));
@@ -72,12 +74,20 @@ const wrap = (handler) => (req, res, next) => handler(req, res).catch(next);
 app.get(
   "/health",
   wrap(async (req, res) => {
+    const result = { ok: true, database: "connected", redis: "connected" };
     try {
       await pool.query("SELECT 1");
-      res.json({ ok: true, database: "connected" });
     } catch {
-      res.status(500).json({ ok: false, database: "unreachable" });
+      result.ok = false;
+      result.database = "unreachable";
     }
+    try {
+      await redis.ping();
+    } catch {
+      result.ok = false;
+      result.redis = "unreachable";
+    }
+    res.status(result.ok ? 200 : 500).json(result);
   })
 );
 
@@ -130,6 +140,82 @@ app.patch(
     );
     if (rows.length === 0) return res.status(409).json({ error: "this draft is locked" });
     res.json(rows[0]);
+  })
+);
+
+const RECORD_COLUMNS =
+  "id, to_char(created_date, 'YYYY-MM-DD') AS date, status, chain, tx_hash, doc_hash, " +
+  "block_number, gas_paid, notarized_at";
+
+app.get(
+  "/contracts/:id/record",
+  wrap(async (req, res) => {
+    const { rows } = await pool.query(
+      `SELECT ${RECORD_COLUMNS} FROM contracts WHERE id = $1 AND status <> 'drafting'`,
+      [req.params.id]
+    );
+    if (rows.length === 0) return res.status(404).json({ error: "not found" });
+    res.json({ ...rows[0], contract_text: "locked, enter the pin from the card to view" });
+  })
+);
+
+app.post(
+  "/contracts/:id/unlock",
+  wrap(async (req, res) => {
+    const { rows } = await pool.query(
+      "SELECT pin_hash, to_char(created_date, 'YYYY-MM-DD') AS date, contract_type, custom_type, " +
+        "party_a_name, party_b_name, terms, notarized_at FROM contracts WHERE id = $1",
+      [req.params.id]
+    );
+    if (rows.length === 0 || !rows[0].pin_hash) return res.status(404).json({ error: "not found" });
+
+    const attempt = await countAttempt(req.params.id);
+    if (!attempt.allowed) {
+      res.set("Retry-After", String(attempt.retryAfterSeconds));
+      return res.status(429).json({
+        error: "too many wrong pins, try again later",
+        retry_after_seconds: attempt.retryAfterSeconds,
+      });
+    }
+
+    const { pin_hash, ...contract } = rows[0];
+    if (!(await pinMatches(normalizePin(req.body && req.body.pin), pin_hash))) {
+      return res.status(403).json({ error: "wrong pin", tries_left: attempt.triesLeft });
+    }
+
+    await clearAttempts(req.params.id);
+    res.json(contract);
+  })
+);
+
+const devKeyHash =
+  process.env.DEV_TOOLS_KEY && process.env.DEV_TOOLS_KEY.length >= 20
+    ? hashToken(process.env.DEV_TOOLS_KEY)
+    : null;
+
+app.post(
+  "/dev/contracts/:id/fake-notarize",
+  wrap(async (req, res) => {
+    if (!devKeyHash || !tokenMatches(req.get("X-Dev-Key"), devKeyHash)) {
+      return res.status(404).json({ error: "not found" });
+    }
+    const pin = newPin();
+    const { rows } = await pool.query(
+      `UPDATE contracts SET status = 'notarized', chain = 'polygon-amoy (simulated)',
+         doc_hash = encode(sha256(convert_to(terms, 'UTF8')), 'hex'),
+         tx_hash = $2, block_number = $3, gas_paid = '0', notarized_at = now(),
+         pin_hash = $4, updated_at = now()
+       WHERE id = $1 AND status <> 'notarized'
+       RETURNING id, to_char(created_date, 'YYYY-MM-DD') AS date`,
+      [
+        req.params.id,
+        "0x" + crypto.randomBytes(32).toString("hex"),
+        crypto.randomInt(10000000, 99999999),
+        await hashPin(pin),
+      ]
+    );
+    if (rows.length === 0) return res.status(409).json({ error: "missing or already notarized" });
+    res.json({ ...rows[0], pin });
   })
 );
 
