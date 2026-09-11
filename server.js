@@ -420,10 +420,7 @@ app.post(
       "UPDATE contracts SET status = 'signed', updated_at = now() WHERE id = $1 AND status = 'awaiting_signatures'",
       [row.id]
     );
-    if (!chainReady()) return res.json({ status: "signed", signed: signedParties });
-    const result = await notarizeContract(row.id, ["signed"]);
-    if (result.error) return res.json({ status: "signed", signed: signedParties, notarize_error: result.error });
-    res.json({ status: "notarized", signed: signedParties, ...result });
+    res.json({ status: "signed", signed: signedParties });
   })
 );
 
